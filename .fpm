@@ -1,0 +1,8 @@
+-s dir
+--name apt-daily-clean
+--description "Clean the apt cache daily."
+--url "https://github.com/cdzombak/apt-daily-clean"
+--maintainer "Chris Dzombak <https://www.dzombak.com>"
+--license "Unlicense"
+-t deb
+-a all

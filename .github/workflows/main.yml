@@ -1,0 +1,197 @@
+---
+name: CI
+
+"on":
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - "main"
+
+permissions:
+  contents: write
+
+env:
+  FPM_VERSION: 1.15.1
+
+jobs:
+
+  meta:
+    name: Derive Build Metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Derive version string
+        id: project_version
+        run: echo "project_version=$(./.version.sh)" >> "$GITHUB_OUTPUT"
+      - name: project_version
+        run: "echo project_version: ${{ steps.project_version.outputs.project_version }}"
+      - name: Check if this is a running version tag update
+        id: running_version_tag
+        run: |
+          if [ -z "${{ github.event.ref }}" ]; then
+              echo "is_running_version_tag_update=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.ref }}" =~ ^refs/tags/v[0-9]+\.[0-9]+$ ]]; then
+              echo "is_running_version_tag_update=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.ref }}" =~ ^refs/tags/v[0-9]+$ ]]; then
+              echo "is_running_version_tag_update=true" >> "$GITHUB_OUTPUT"
+          else
+              echo "is_running_version_tag_update=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: is_running_version_tag
+        run: "echo is_running_version_tag_update: ${{ steps.running_version_tag.outputs.is_running_version_tag_update }}"
+    outputs:
+      project_name: ${{ github.event.repository.name }}
+      project_version: ${{ steps.project_version.outputs.project_version }}
+      aptly_repo_name: oss
+      aptly_dist: any
+      aptly_publish_prefix: s3:dist.cdzombak.net:deb_oss
+      is_prerelease: >-
+        ${{
+          steps.running_version_tag.outputs.is_running_version_tag_update != 'true' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+            (contains(github.ref, '-alpha.')
+            || contains(github.ref, '-beta.')
+            || contains(github.ref, '-rc.'))
+        }}
+      is_release: >-
+        ${{
+          steps.running_version_tag.outputs.is_running_version_tag_update != 'true' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+            !(contains(github.ref, '-alpha.')
+            || contains(github.ref, '-beta.')
+            || contains(github.ref, '-rc.'))
+        }}
+      is_pull_request: ${{ github.event_name == 'pull_request' }}
+      is_running_version_tag_update: ${{ steps.running_version_tag.outputs.is_running_version_tag_update }}
+
+  package:
+    name: Debian Package
+    needs: meta
+    if: needs.meta.outputs.is_running_version_tag_update != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+      - name: Install fpm
+        run: |
+          gem install --no-document fpm -v "$FPM_VERSION"
+      - name: Build package
+        shell: bash
+        run: |
+          VERSION_TAG="${{ needs.meta.outputs.project_version }}"
+          VERSION_NO_V="${VERSION_TAG:1}"
+          mkdir -p ./out
+          fpm -v ${VERSION_NO_V} \
+            -p ./out/${{ needs.meta.outputs.project_name }}-${VERSION_NO_V}-all.deb \
+            ./apt-clean=/etc/cron.daily/apt-clean
+          ls -lh ./out
+      - name: Upload package
+        uses: actions/upload-artifact@v3
+        with:
+          name: Package
+          path: out/*.deb
+
+  release:
+    name: GitHub Release
+    needs: [package, meta]
+    runs-on: ubuntu-latest
+    if: >-
+      needs.meta.outputs.is_release == 'true' ||
+      needs.meta.outputs.is_prerelease == 'true'
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v3
+        with:
+          name: Package
+          path: out
+      - name: List artifacts
+        working-directory: out
+        run: ls -R
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: out/*.deb
+          prerelease: false
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          tag_name: "${{ needs.meta.outputs.project_version }}"
+
+  aptly:
+    name: Aptly
+    needs: [meta, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v3
+        with:
+          name: Package
+          path: out
+      - name: List artifacts
+        run: ls -R
+        working-directory: out
+      - name: Login to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-actions
+      - name: Push to Aptly Repo
+        shell: bash
+        run: |
+          set -x
+          for DEB in out/*.deb; do
+            curl -u "${{ secrets.APTLY_CRED }}" \
+              -fsS -X POST \
+              -F file=@"${DEB}" \
+              "${{ secrets.APTLY_API }}/files/${{ needs.meta.outputs.project_name }}-${{ needs.meta.outputs.project_version }}"
+          done
+          curl -u "${{ secrets.APTLY_CRED }}" \
+            -fsS -X POST \
+            "${{ secrets.APTLY_API }}/repos/${{ needs.meta.outputs.aptly_repo_name }}/file/${{ needs.meta.outputs.project_name }}-${{ needs.meta.outputs.project_version }}?forceReplace=1"
+      - name: Update Published Aptly Repo
+        run: |
+          set -x
+          curl -u "${{ secrets.APTLY_CRED }}" \
+            -fsS -X PUT \
+            -H 'Content-Type: application/json' \
+            --data '{"ForceOverwrite": true}' \
+            "${{ secrets.APTLY_API }}/publish/${{ needs.meta.outputs.aptly_publish_prefix }}/${{ needs.meta.outputs.aptly_dist }}?_async=true"
+
+  ntfy:
+    name: Ntfy
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    needs: [meta, package, release, aptly]
+    steps:
+      - name: Send success notification
+        uses: niniyas/ntfy-action@master
+        if: ${{ !contains(needs.*.result, 'failure') && (needs.meta.outputs.is_release == 'true' || needs.meta.outputs.is_prerelease == 'true') }}
+        with:
+          url: "https://ntfy.cdzombak.net"
+          topic: "gha-builds"
+          priority: 3
+          headers: '{"authorization": "Bearer ${{ secrets.NTFY_TOKEN }}"}'
+          tags: white_check_mark
+          title: ${{ github.event.repository.name }} ${{ needs.meta.outputs.project_version }} available
+          details: ${{ github.event.repository.name }} version ${{ needs.meta.outputs.project_version }} is now available.
+      - name: Send failure notification
+        uses: niniyas/ntfy-action@master
+        if: ${{ contains(needs.*.result, 'failure') }}
+        with:
+          url: "https://ntfy.cdzombak.net"
+          topic: "gha-builds"
+          priority: 3
+          headers: '{"authorization": "Bearer ${{ secrets.NTFY_TOKEN }}"}'
+          tags: no_entry
+          title: ${{ github.event.repository.name }} ${{ needs.meta.outputs.project_version }} build failed
+          details: Build failed for ${{ github.event.repository.name }} version ${{ needs.meta.outputs.project_version }}.

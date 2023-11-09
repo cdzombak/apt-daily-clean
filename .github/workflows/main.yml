@@ -130,6 +130,7 @@ jobs:
     name: Aptly
     needs: [meta, package]
     runs-on: ubuntu-latest
+    if: needs.meta.outputs.is_release == 'true'
     steps:
       - name: Download package
         uses: actions/download-artifact@v3
